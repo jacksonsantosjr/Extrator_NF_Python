@@ -1,0 +1,14 @@
+flet>=0.21.0
+pdfplumber>=0.10.4
+pytesseract>=0.3.10
+pandas>=2.2.0
+openpyxl>=3.1.2
+pydantic>=2.6.1
+pydantic-settings>=2.2.1
+loguru>=0.7.2
+tomli>=2.0.1
+Pillow>=10.2.0
+PyMuPDF>=1.23.22
+requests>=2.31.0
+customtkinter>=5.2.2
+packaging>=23.2

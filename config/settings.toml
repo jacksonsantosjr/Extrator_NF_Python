@@ -1,0 +1,44 @@
+[app]
+name = "Fiscal Document Extractor"
+version = "1.0.0"
+theme = "dark"  # dark or light
+
+[processing]
+# Maximum number of concurrent file processing tasks
+# Pode ser alto porque só usamos regex (instantâneo), sem IA
+max_concurrent_files = 3
+
+# Maximum number of pages to process per PDF (0 = unlimited)
+pdf_page_limit = 0
+
+# Minimum text length to consider PDF as text-based (not scanned)
+min_text_length = 50
+
+[performance]
+# Target processing times (for monitoring/optimization)
+target_text_pdf_seconds = 5
+target_scanned_pdf_seconds = 60
+target_pdfs_per_hour = 100
+
+[ocr]
+# Tesseract language (por = Portuguese)
+language = "por"
+
+# Image preprocessing for better OCR
+enable_preprocessing = true
+dpi = 300
+
+[export]
+# Excel export settings
+auto_fit_columns = true
+apply_filters = true
+freeze_header_row = true
+
+[llm]
+# Local LLM configuration (Ollama)
+# DESABILITADO: Usando Ollama diretamente no extractor_text.py com estratégia otimizada
+# O Vision (moondream) levava 90s+ por nota, agora usamos regex + phi3 apenas se necessário
+enabled = false
+model_name = "moondream"
+base_url = "http://localhost:11434"
+confidence_threshold = 0.8
