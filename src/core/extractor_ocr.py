@@ -57,14 +57,13 @@ class OCRExtractor:
             if not ocr_text.strip():
                 raise ValueError("No text extracted from OCR")
             
-            # Use text extractor to parse the OCR'd text
-            # (reusing all the regex patterns and logic)
+            # Use text extractor to parse the OCR'd text (first pass with default DPI)
             temp_doc = self.text_extractor.extract(
                 self._create_text_pdf(ocr_text),
                 filename
             )
             
-            # Copy extracted data
+            # Copy extracted data from first pass
             doc.document_type = temp_doc.document_type
             doc.numero = temp_doc.numero
             doc.serie = temp_doc.serie
@@ -76,24 +75,106 @@ class OCRExtractor:
             doc.valores = temp_doc.valores
             doc.itens = temp_doc.itens
             
+            # [FIX] Hybrid DPI: If destinatário CNPJ is missing, try second pass with different DPI
+            # This happens when table data is not captured at DPI 400 but is at DPI 200
+            needs_second_pass = (
+                doc.destinatario is None or 
+                (doc.destinatario and not doc.destinatario.cnpj)
+            )
+            
+            # Log extraction results for debugging
+            logger.debug(f"First pass results - destinatario: {doc.destinatario}, has_cnpj: {doc.destinatario.cnpj if doc.destinatario else 'N/A'}")
+            
+            if needs_second_pass:
+                logger.debug(f"needs_second_pass=True, calling _detect_layout_for_dpi")
+                recommended_dpi = self._detect_layout_for_dpi(ocr_text)
+                logger.debug(f"recommended_dpi={recommended_dpi}, current_dpi={self.dpi}")
+                if recommended_dpi > 0 and recommended_dpi != self.dpi:
+                    logger.info(f"Second pass with DPI {recommended_dpi} to get missing destinatário")
+                    # [FIX] Use dpi_override parameter instead of modifying self.dpi (thread-safety)
+                    ocr_text_2 = self._pdf_to_text_ocr(pdf_bytes, page_limit, dpi_override=recommended_dpi)
+                    
+                    # Extract from second pass
+                    temp_doc_2 = self.text_extractor.extract(
+                        self._create_text_pdf(ocr_text_2),
+                        filename
+                    )
+                    
+                    logger.debug(f"Second pass results - destinatario: {temp_doc_2.destinatario}, has_cnpj: {temp_doc_2.destinatario.cnpj if temp_doc_2.destinatario else 'N/A'}")
+                    
+                    # Only fill in MISSING fields from second pass
+                    if temp_doc_2.destinatario and temp_doc_2.destinatario.cnpj:
+                        logger.info(f"Merging destinatario CNPJ from second pass: {temp_doc_2.destinatario.cnpj}")
+                        if doc.destinatario is None:
+                            doc.destinatario = temp_doc_2.destinatario
+                        elif not doc.destinatario.cnpj:
+                            doc.destinatario.cnpj = temp_doc_2.destinatario.cnpj
+                            if not doc.destinatario.razao_social and temp_doc_2.destinatario.razao_social:
+                                doc.destinatario.razao_social = temp_doc_2.destinatario.razao_social
+                    else:
+                        logger.warning(f"Second pass did not capture destinatario CNPJ")
+            
         except Exception as e:
             logger.error(f"Error in OCR extraction for {filename}: {e}")
             doc.error_message = str(e)
         
         return doc
     
-    def _pdf_to_text_ocr(self, pdf_bytes: bytes, page_limit: int = 0) -> str:
+    def _detect_layout_for_dpi(self, text: str) -> int:
+        """
+        Detect layout from OCR text and return optimal DPI.
+        Some layouts require higher DPI for accurate extraction.
+        
+        Returns:
+            Recommended DPI for this layout (0 = use current)
+        """
+        text_upper = text.upper()
+        
+        # Recife layout: requires 600 DPI for proper number extraction
+        if 'PREFEITURA' in text_upper and 'RECIFE' in text_upper:
+            logger.debug("Detected Recife layout - recommending DPI 600")
+            return 600
+        
+        # São Paulo layout: if number appears corrupted, try different DPI
+        # Check if "SÃO PAULO" present but no 8-digit number starting with 00
+        if 'PREFEITURA' in text_upper and 'SÃO PAULO' in text_upper:
+            import re
+            # Check if 8-digit number with leading zeros exists (00XXXXXX)
+            has_sp_number = re.search(r'00\d{6}', text)
+            if not has_sp_number:
+                logger.debug("Detected São Paulo layout with missing number - recommending DPI 200")
+                return 200  # Lower DPI works better for some scanned documents
+        
+        # NFS-e layouts with table data missing (ADL, etc.): 
+        # If TOMADOR label present but no CNPJ data captured, retry with lower DPI
+        if 'TOMADOR' in text_upper and 'NFS-E' in text_upper:
+            import re
+            # Check if there's actual CNPJ data after TOMADOR section
+            tomador_pos = text_upper.find('TOMADOR')
+            text_after_tomador = text[tomador_pos:tomador_pos + 500] if tomador_pos > 0 else ''
+            has_tomador_cnpj = re.search(r'\d{2}[.,]\d{3}[.,]\d{3}[/\\]\d{4}[-]?\d{2}', text_after_tomador)
+            if not has_tomador_cnpj:
+                logger.debug("Detected NFS-e with missing TOMADOR data - recommending DPI 200")
+                return 200
+        
+        return 0  # Use current DPI
+    
+    def _pdf_to_text_ocr(self, pdf_bytes: bytes, page_limit: int = 0, dpi_override: int = None) -> str:
         """
         Convert PDF to text using OCR.
         
         Args:
             pdf_bytes: PDF file bytes
             page_limit: Maximum pages to process
+            dpi_override: Optional DPI to use instead of self.dpi (for thread-safety)
         
         Returns:
             Extracted text from all pages
         """
         full_text = ""
+        
+        # Use override DPI if provided (thread-safe), otherwise use instance DPI
+        effective_dpi = dpi_override if dpi_override is not None else self.dpi
         
         try:
             # Open PDF with PyMuPDF
@@ -102,13 +183,13 @@ class OCRExtractor:
             total_pages = len(pdf_document)
             pages_to_process = total_pages if page_limit == 0 else min(page_limit, total_pages)
             
-            logger.info(f"Processing {pages_to_process} pages with OCR (DPI: {self.dpi})")
+            logger.info(f"Processing {pages_to_process} pages with OCR (DPI: {effective_dpi})")
             
             for page_num in range(pages_to_process):
                 page = pdf_document[page_num]
                 
                 # Render page to image
-                pix = page.get_pixmap(dpi=self.dpi)
+                pix = page.get_pixmap(dpi=effective_dpi)
                 
                 # Convert to PIL Image
                 img_data = pix.tobytes("png")
@@ -120,11 +201,11 @@ class OCRExtractor:
                 
                 # Perform OCR with optimized config for fiscal documents
                 # PSM 4 = Assume a single column of text of variable sizes
-                # This works better for NFS-e layouts than PSM 6
+                # OEM 3 = Default, based on what is available (LSTM preferred)
                 page_text = pytesseract.image_to_string(
                     image,
                     lang=self.language,
-                    config='--psm 4 --oem 3'  # PSM 4 + LSTM engine
+                    config='--psm 4 --oem 3'
                 )
                 
                 full_text += page_text + "\n"
@@ -141,7 +222,7 @@ class OCRExtractor:
     def _preprocess_image(self, image: Image.Image) -> Image.Image:
         """
         Preprocess image for better OCR results.
-        Applies grayscale, auto-contrast, and light sharpening.
+        Conservative: grayscale, auto-contrast, moderate sharpening.
         """
         try:
             # Convert to grayscale
@@ -151,9 +232,9 @@ class OCRExtractor:
             from PIL import ImageOps
             image = ImageOps.autocontrast(image, cutoff=1)
             
-            # Light sharpening to improve text edges
+            # Moderate sharpening to improve text edges
             enhancer = ImageEnhance.Sharpness(image)
-            image = enhancer.enhance(1.5)  # Slight sharpening
+            image = enhancer.enhance(1.5)
             
         except Exception as e:
             logger.warning(f"Error in image preprocessing: {e}")

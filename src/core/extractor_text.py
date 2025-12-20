@@ -257,12 +257,54 @@ class TextExtractor:
                     else:
                         logger.warning(f"Spatial extraction rejected candidate '{candidate_num}' because it looks like a Date.")
         patterns = [
+            # [FIX] NFS-e São Paulo: número de 8 dígitos com zeros à esquerda SOZINHO em uma linha
+            # Texto OCR: linha 5 "00000833" ou "00026358" - número isolado na própria linha
+            r'(?:\n|^)\s*(00\d{6})\s*(?:\n|$)',
+            
+            # [FIX] NFS-e Guarulhos RENOSUL: "NFS-e 96148" ou "NFS-e\n96148" (número direto após label)
+            # Texto OCR: linha 6 "NFS-e 96148" - formato mais simples sem "nº" ou ":"
+            r'NFS-e\s+(\d{5,6})',
+            
+            # [FIX] NFS-e Barueri FORPONTO: "Número da Nota" seguido de número 6 dígitos em linha separada
+            # Texto OCR: linha 10 "Número da Nota Série da Nota" ... linha 14 "002544"
+            # O número aparece SOZINHO em uma linha, começando com 00
+            r'N[úu]mero\s+da\s+Nota[^\n]*\n(?:[^\n]*\n){0,5}\s*(00\d{4,6})\s*$',
+            
+            # [FIX] NFS-e Barueri: Número vem DEPOIS do código de autenticidade na mesma linha
+            # Texto: "493Q.0820.8311.1890799-S 000016" - captura os 6 dígitos após o código
+            r'[A-Z0-9]{3,4}[A-Z]?\.\d{4}\.\d{4}\.\d+-[A-Z]\s+(\d{5,8})',
+            
+            # [FIX] NFS-e Barueri alternativo: "Série da Nota" seguido de número em próxima linha
+            r'S[ée]rie\s+da\s+Nota\s*\n[^\n]*?(\d{6})',
+            
+            # [FIX] NFS-e Itapevi (DURACAP): "Número Nota Fiscal:" seguido de número
+            # PRIORIDADE ALTA: Preferir "Número Nota Fiscal" sobre "Número RPS"
+            r'N[úu]mero\s+Nota\s+Fiscal[:\s]+(\d{5,8})',
+            
+            # [FIX] NFS-e Itapevi (DURACAP) OCR: "Fatura Nro 128137" na linha de resumo
+            # Texto OCR: "Nota Fiscal Fatura Fatura Nro 128137 | Valor R$"
+            r'Fatura\s+Nro\s+(\d{5,8})',
+            
+            # [FIX] NFS-e Itapevi (DURACAP) OCR alternativo: RPS seguido de Nota Fiscal na mesma linha
+            # Texto OCR: "128417 128148] 04/12/2025" - captura o segundo número (Nota Fiscal)
+            r'\d{5,6}\s+(\d{5,6})\]',
+            
             # [FIX] NFS-e São Paulo OTUS: "Número da Nota\n00002219" (número em linha separada)
             # PRIORIDADE ALTA para evitar capturar RPS
             r'N[úu]mero\s+da\s+Nota\s*\n\s*(\d{5,})',
             
-            # [FIX] OCR NFS-e SP: número com colchete no início "[002226" ou apenas no início do documento
-            r'SÃO\s+PAULO\s*[\[\(]?(\d{6,8})',
+            # [FIX] OCR NFS-e SP: número após "SÃO PAULO" com possíveis artefatos OCR antes dos dígitos
+            # Texto OCR: 'SÃO PAULO """"no02227' - captura dígitos após quaisquer caracteres
+            r'SÃO\s+PAULO[^\d\n]*(\d{5,8})',
+            
+            # [FIX] NFS-e Recife DPI 600: número completo de 8 dígitos após "Número da Nota"
+            # Texto OCR: "Múumero da Mota\nAt ] 00016668" - número na linha seguinte
+            r'[MN][úu][úu]?mero\s+d[ae]\s+[MN]ota[^\d]*(\d{8})',
+            
+            # [FIX] NFS-e Recife DPI 400: número fragmentado com espaço "0001 668" após PREFEITURA
+            # Texto OCR: "PREFEITURA DO 0001 668 —" - captura os dígitos e concatena
+            r'PREFEITURA.*?(\d{3,4})\s+(\d{3,5})',
+            
             r'[\[\(](\d{6,8})\s*\n.*(?:Data|Emissão)',
             
             # NFS-e Caieiras: "Número da Nota/Série 2.757/NFE" (número com separador de milhar + série)
@@ -271,6 +313,10 @@ class TextExtractor:
             # [FIX] NFS-e Itatiba: Labels colados sem espaços "NúmerodaNFS-e" seguido de número
             # O texto aparece como: "NúmerodaNFS-e CompetênciadaNFS-e...\n183 01/12/2025"
             r'N[úu]merodaNFS-?e[^\d]*(\d{3,})',
+            
+            # [FIX] NFS-e São Paulo POWER TEC: "NúmerodaNota" (label colado) seguido de número
+            # Texto OCR: linha 3 "|NúmerodaNota |" e linha 4 "PREFEITURA...SÃO PAULO 00000835"
+            r'N[úu]merodaNota[^\d]*(\d{5,8})',
             # Aceita "Nota 144", "NF 144", "Documento 144" - MAS NÃO "RPS"
             r'(?:N[úu]mero|N[º°]|Doc|N\.|NF|Nota|Documento)\s*[:\.]\s*(\d{3,10})',
             
@@ -290,17 +336,27 @@ class TextExtractor:
             # GENERIC PATTERNS (require 5+ digits normally, but prioritized explicit ones above)
             r'N[úuÚU]MERO[^\d]*(\d{5,})', 
             r'N[úu]mero[:\s]*(\d{5,})',
-            r'N[º°][:\s]*(\d{5,})',
-            r'N\.?[\sº°][:\s]*(\d{5,})',
+            r'N[º°5oO0][:\s]*(\d{5,})',
+            r'N\.?[\sº°5oO0][:\s]*(\d{5,})',
         ]
         
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
             if match:
-                num = match.group(1).strip()
+                # [FIX] Suporte a múltiplos grupos de captura (ex: número fragmentado "0001 668")
+                if len(match.groups()) > 1:
+                    # Concatenar todos os grupos (para padrões como Recife)
+                    num = ''.join(g for g in match.groups() if g)
+                    # [FIX] Recife: Se o resultado tem 7 dígitos, pad para 8 (padrão NFS-e Recife)
+                    if len(num) == 7 and num.startswith('000'):
+                        num = num.zfill(8)  # 0001668 -> 00001668
+                else:
+                    num = match.group(1).strip()
                 
                 # Remover separador de milhar (ex: 2.757 -> 2757)
                 num = num.replace('.', '')
+                
+
                 
                 # [FIX] Validações de tamanho
                 if len(num) == 44: continue  # Chave de Acesso
@@ -315,6 +371,35 @@ class TextExtractor:
                 
                 logger.debug(f"Matched numero '{num}' with pattern: {pattern[:50]}...")
                 return num
+        
+        # [FIX] Fallback OCR Salvador: número após "SALVADOR" com letras OCR corrompidas
+        # Texto OCR: 'SALVADOR  [ooo0s74o ?' onde 'ooo0s74o' = '00008740'
+        # Texto OCR: 'SALVADOR  [mo00s7ss ?' onde 'mo00s7ss' = '00008739'
+        # IMPORTANTE: Número da nota aparece em colchetes na primeira linha
+        # Incluir: m (parece 00), o (parece 0), s (parece 8/3/9), n (parece 0)
+        salvador_match = re.search(r'SALVADOR[^\n]*?[\[\(]([moOnOs0-9]{6,10})[\s\?\]]', text, re.IGNORECASE)
+        if salvador_match:
+            ocr_num = salvador_match.group(1)
+            # Converter letras confundidas com dígitos
+            # Primeira passagem: substituições diretas
+            ocr_num = ocr_num.replace('o', '0').replace('O', '0')
+            ocr_num = ocr_num.replace('n', '0').replace('N', '0')
+            ocr_num = ocr_num.replace('m', '0').replace('M', '0')  # m parece 00 mas conta como 1 char
+            ocr_num = ocr_num.replace('s', '8').replace('S', '8')  # s geralmente é 8
+            # Se ainda não é só dígitos, tentar s→3 ou s→9
+            if not ocr_num.isdigit():
+                ocr_num = ocr_num.replace('s', '3').replace('S', '3')
+            if ocr_num.isdigit() and len(ocr_num) >= 6:
+                logger.debug(f"Matched numero '{ocr_num}' with Salvador OCR fallback")
+                return ocr_num
+        
+        # [FIX] Fallback: Se nenhum padrão encontrou o número, usar RPS como guia
+        # Retorna "RPS-XXXX" para ajudar na identificação manual
+        rps_match = re.search(r'RPS\s*N[º°]?\s*(\d{1,6})', text, re.IGNORECASE)
+        if rps_match:
+            rps_num = rps_match.group(1)
+            logger.debug(f"Using RPS fallback: RPS-{rps_num}")
+            return f"RPS-{rps_num}"
         
         return None
     
@@ -452,6 +537,10 @@ class TextExtractor:
         if name_upper == 'NOME': return False
         if len(name) < 4: return False
         if name.isdigit(): return False
+        # [FIX] Rejeitar nomes que contêm fragmentos de labels (artefatos OCR)
+        if 'RAZÃO SOCIAL' in name_upper or 'RAZAO SOCIAL' in name_upper: return False
+        if 'NOME/' in name_upper or '/NOME' in name_upper: return False
+        if 'MOMEI' in name_upper: return False  # OCR de "Nome/" corrompido
         return True
     def _extract_emitente(self, text: str, **kwargs) -> Optional[Entity]:
         entity = Entity()
@@ -474,9 +563,45 @@ class TextExtractor:
             # [FIX] Usar 'TOMADOR DE SERVIÇOS' como end_label completo
             end_labels=['TOMADOR DE SERVIÇOS', 'DESTINAT', 'TOMADOR', 'DADOS DO TOMADOR', 'VALORES', 'ITENS', 'DISCRIMINAÇÃO']
         )
+        
+        # [FIX] NFS-e Guarulhos: Verificar padrão "Prestador do Serviço NOME" ANTES de processar seção
+        # Alguns layouts têm nome na mesma linha do label, não na seção
+        prestador_inline_match = re.search(r'Prestador\s+do\s+Servi[çc]o\s+([A-ZÀ-Ú][A-ZÀ-Ú0-9\s\.&\-]{3,30}?)(?:\n|$)', text, re.IGNORECASE)
+        prestador_inline_name = prestador_inline_match.group(1).strip() if prestador_inline_match else None
+        
         if section:
             section_entity = self._parse_entity_from_section(section)
             if section_entity.cnpj:
+                # [FIX] Se razao_social é inválida (muito curta ou logo), buscar alternativa
+                if section_entity.razao_social and len(section_entity.razao_social) < 12:
+                    # Buscar linha com sufixo empresarial na seção
+                    # Padrão: linha que começa com letra e termina com LTDA/ME/etc
+                    for line in section.split('\n'):
+                        line = line.strip()
+                        # Ignorar linhas de label (começam com Nome, Razão, CPF, etc)
+                        if re.match(r'^(?:Nome|Razão|Raz[ãa]o|CPF|CNPJ|Inscrição|Endereço)', line, re.IGNORECASE):
+                            continue
+                        if len(line) >= 15 and re.search(r'(?:LTDA|S\.?A\.?|ME|EPP|EIRELI|S/A)\b', line, re.IGNORECASE):
+                            # Limpar caracteres extras no final (logos, pipes)
+                            better_name = re.sub(r'\s*[|]\s*.*$', '', line).strip()
+                            # Verificar se começa com letra e é razoável
+                            if re.match(r'^[A-ZÀ-Ú]', better_name) and len(better_name) >= 15:
+                                section_entity.razao_social = better_name[:100]
+                                logger.info(f"Salvador fallback razao_social: {section_entity.razao_social}")
+                                break
+                    # [FIX] Guarulhos: Se ainda não achou nome bom, usar prestador inline
+                    if len(section_entity.razao_social or '') < 12 and prestador_inline_name:
+                        section_entity.razao_social = prestador_inline_name
+                        logger.info(f"Guarulhos inline razao_social: {section_entity.razao_social}")
+                        
+                # [FIX] Guarulhos: Verificar se razao_social parece um bairro/localidade
+                # Nomes como "CIDADE INDL SA" são provavelmente locais, não empresas
+                if section_entity.razao_social and prestador_inline_name:
+                    bad_keywords = ['CIDADE', 'BAIRRO', 'CENTRO', 'VILA', 'JARDIM', 'PARQUE']
+                    if any(kw in section_entity.razao_social.upper() for kw in bad_keywords):
+                        section_entity.razao_social = prestador_inline_name
+                        logger.info(f"Guarulhos location-name fix: {section_entity.razao_social}")
+                        
                 if found_reliable_name: # Protege nome espacial
                     section_entity.razao_social = entity.razao_social
                 return section_entity
@@ -506,6 +631,15 @@ class TextExtractor:
         # 3. Regex Fallback (Only if we don't have a reliable name from Spatial)
         if not found_reliable_name and not entity.razao_social:
             name_patterns = [
+                # [FIX] NFS-e ADL: nome antes de "Nº:" ou variações OCR (N5:, No:, N0:) na mesma linha
+                # Texto OCR DPI 400: "A DE L SIQUEIRA ME Nº: 7354" 
+                # Texto OCR DPI 200: "+ 4 DE L SIQUEIRA ME N5: 7354" (começa corrompido)
+                r'(?:\n|^).{0,3}([A-ZÀ-Ú][A-ZÀ-Ú0-9\s\.&\-]{5,50}?)\s*N[º°5oO0]:\s*\d+',
+                
+                # [FIX] NFS-e Guarulhos RENOSUL: nome na MESMA LINHA após "Prestador do Serviço"
+                # Texto OCR: "Prestador do Serviço RENOSUL\n" - nome direto após label até quebra de linha
+                r'Prestador\s+do\s+Servi[çc]o\s+([A-ZÀ-Ú][A-ZÀ-Ú0-9\s\.&\-]{3,30}?)(?:\n|$)',
+                
                 # Padrão NFS-e SP: linha após "Nome/NomeEmpresarial" contém "CNPJ_parcialNOME"
                 # Ex: "35.600.304FABIOLUIZSANTOSSILVA"
                 r'Nome/?NomeEmpresarial[^\n]*\n[\d\.\-/]+([A-Z][A-Z]+(?:[A-Z]+)*)\s',
@@ -616,11 +750,18 @@ class TextExtractor:
                 break
         if start_pos == -1: return None
         
-        # Avançar para após o label e pular até o próximo newline (para não pegar texto da mesma linha)
+        # Avançar para após o label
         start_pos += found_label_len
+        
+        # [FIX] NFS-e Barueri: NÃO pular para próxima linha se há nome empresarial na mesma linha
+        # Verificar se o texto até o próximo newline contém sufixo empresarial (LTDA, S.A., etc.)
         newline_pos = text.find('\n', start_pos)
-        if newline_pos != -1 and newline_pos < start_pos + 50:
-            start_pos = newline_pos + 1
+        if newline_pos != -1:
+            same_line_text = text[start_pos:newline_pos]
+            # Se a mesma linha contém sufixo empresarial, manter o texto
+            has_company_name = bool(re.search(r'(?:LTDA|S\.?A\.?|ME|EPP|EIRELI|S/A)', same_line_text, re.IGNORECASE))
+            if not has_company_name and newline_pos < start_pos + 50:
+                start_pos = newline_pos + 1
         
         end_pos = len(text)
         for label in end_labels:
@@ -652,6 +793,18 @@ class TextExtractor:
                 break
         
         razao_patterns = [
+            # [FIX] NFS-e Barueri: Nome empresarial na 1ª linha da seção (sem label)
+            # Captura linha iniciando com maiúscula, terminando com sufixo empresarial
+            # PRIORIDADE MÁXIMA - padrão mais específico
+            r'^\s*([A-ZÀ-Ú][A-ZÀ-Ú0-9\s\.\&\-]+(?:LTDA|S\.?A\.?|ME|EPP|EIRELI|S/A))\s*$',
+            
+            # [FIX] Alternativo: qualquer linha com sufixo empresarial
+            r'([A-ZÀ-Ú][A-ZÀ-Ú0-9\s\.\&\-]{5,}(?:LTDA|S\.?A\.?|ME|EPP|EIRELI|S/A))',
+            
+            # [FIX] NFS-e Salvador: nome empresa pode estar em linha após "Nome/Razão Social:"
+            # Ex: "Nome/Razão Social: polo ir\nPITECNOLOGIA DA INFORMAÇÃO LTDA - ME"
+            r'Nome/Raz[ãa]o\s+Social:[^\n]*\n([A-ZÀ-Ú][A-ZÀ-Ú0-9\s\.\&\-]+(?:LTDA|S\.?A\.?|ME|EPP|EIRELI|S/A)[^\n]*)',
+            
             # Padrão NFS-e SP: CNPJ.parcial seguido de nome colado (ex: 35.600.304FABIOLUIZSANTOSSILVA)
             r'\d{2}\.\d{3}\.\d{3}([A-Z][A-Z]+(?:[A-Z]+)*)\s',
             
@@ -663,23 +816,40 @@ class TextExtractor:
             # Ignora caracteres antes e captura nome após ":", "." ou espaços
             r'(?:Nome.?)?Raz[ãa]o\s+Social[:\.\s]+([A-ZÀ-Ú][A-ZÀ-Ú0-9\s\.\&\-]+)',
             
-            # Padrões genéricos
-            r'(?:Raz[ãa]o\s+Social|Nome)[:\s]*([A-ZÀ-Ú0-9][A-ZÀ-Ú0-9\s\.\&\-]+)',
+            # Padrões genéricos - EXCLUIR "Nome Tomador" para evitar falsos positivos
+            r'Raz[ãa]o\s+Social[:\s]*([A-ZÀ-Ú0-9][A-ZÀ-Ú0-9\s\.\&\-]+)',
         ]
         for pattern in razao_patterns:
-            match = re.search(pattern, section, re.IGNORECASE)
+            match = re.search(pattern, section, re.IGNORECASE | re.MULTILINE)
             if match:
                 name = match.group(1).strip()
                 # Limpar números iniciais
                 name = re.sub(r'^[\d\.\-/]+', '', name).strip()
                 
+                # [FIX] Remover artefatos OCR de labels no início do nome
+                # IMPORTANTE: Só aplicar se o resultado for longo o suficiente (10+ chars)
+                cleaned_name = re.sub(r'^.*?(?:Raz[ãa]o|Social|Nome|Razao)\s+(?:Social\s+)?', '', name, flags=re.IGNORECASE).strip()
+                if len(cleaned_name) >= 10:
+                    name = cleaned_name
+                
                 # [FIX] Inserir espaços antes de sufixos empresariais colados
-                # Ex: "TOTVSS.A." -> "TOTVS S.A.", "EMPRESALTDA" -> "EMPRESA LTDA"
                 name = re.sub(r'([A-ZÀ-Ú])(S\.A\.|S\.A|SA|S/A)$', r'\1 \2', name, flags=re.IGNORECASE)
                 name = re.sub(r'([A-ZÀ-Ú])(LTDA|ME|EPP|EIRELI)$', r'\1 \2', name, flags=re.IGNORECASE)
                 
-                # [FIX] Aplica Blacklist AQUI TAMBÉM
-                if name and self._check_name_blacklist(name):
+                # [FIX] Rejeitar nomes muito curtos e tentar próximo padrão
+                if len(name) < 10:
+                    logger.debug(f"Rejecting short name '{name}', trying next pattern")
+                    continue
+                
+                # [FIX] Rejeitar nomes que são logos ou artefatos OCR comuns
+                invalid_names = ['polo it', 'polo ir', 'poloit', 'logo']
+                if name.lower().strip() in invalid_names:
+                    logger.debug(f"Rejecting invalid/logo name '{name}', trying next pattern")
+                    continue
+                
+                # [FIX] Nome deve ter sufixo empresarial ou ser longo o suficiente
+                has_suffix = any(s in name.upper() for s in ['LTDA', 'S.A', 'SA', 'ME', 'EPP', 'EIRELI', 'S/A'])
+                if has_suffix or len(name) >= 15:
                     entity.razao_social = name.split('\n')[0].strip()[:100]
                     logger.info(f"Parsed razao_social from section: {entity.razao_social}")
                     break
@@ -691,6 +861,10 @@ class TextExtractor:
     def _extract_address(self, text: str) -> Optional[Address]:
         address = Address()
         log_patterns = [
+            # [FIX] NFS-e Barueri: Endereço multi-linha começando com RUA/AVENIDA
+            # Ex: "RUA POMPEIA , 368\nCHACARAS MARCO / CRUZ PRETA\nCEP 06419-140 - BARUERI - SP"
+            r'((?:RUA|AVENIDA|AV\.?)\s+[A-ZÀ-Ú0-9][A-ZÀ-Ú0-9\s\,\.\-]+?)(?=\n.*CNPJ|\n.*Inscrição|\n.*Telefone|$)',
+            
             # Padrão NFS-e SP: linha após "Endereço Município CEP" contém endereço colado
             # Ex: "FABIODEALMEIDAMAGALHAES,120,JARDIMSANTOELIAS SãoPaulo-SP 5135370"
             r'Endere[çc]o\s+Munic[íi]pio\s+CEP\n([A-ZÀ-Ú0-9][A-ZÀ-Ú0-9\,\s\.\-]+?)(?:\s+[A-ZÀ-Ú][a-zà-ú]+(?:Paulo|Janeiro)?-?[A-Z]{2})',
