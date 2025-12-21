@@ -77,8 +77,8 @@ class ExcelReporter:
         
         for doc in documents:
             row = {
+                # Columns in exact order matching web version
                 'Tipo Documento': doc.document_type.value,
-                'Número Documento': doc.numero,
                 'Número Documento': doc.numero,
                 'Data Emissão': self._format_date(doc.data_emissao),
                 'Data Saída/Entrada': self._format_date(doc.data_saida_entrada),
@@ -91,7 +91,7 @@ class ExcelReporter:
                 # Destinatário
                 'Destinatário CNPJ/CPF': self._clean_cnpj(doc.destinatario.cnpj) if doc.destinatario else None,
                 
-                # Filiais logic
+                # Filiais
                 'COLIGADA': doc.coligada,
                 'FILIAL': doc.filial,
                 
@@ -101,26 +101,26 @@ class ExcelReporter:
                 # Valores
                 'Valor Total Documento': doc.valores.valor_total if doc.valores else None,
                 'Valor Líquido Documento': doc.valores.valor_liquido if doc.valores else None,
-                'Valor Total Produtos/Serviços': doc.valores.valor_servicos if doc.valores else None, # Assuming services = products for general XML
-                'Valor Frete': doc.valores.outras_retencoes if doc.valores else None, # Mapping "Outras Retenções" as a placeholder for extra values, or check if we added frete? We added "outras_retencoes". I'll use that for now or leave None if explicitly frete needed. 
-                # Wait, "outras_retencoes" in TaxValues was mapped from "Outras Retenções". 
-                # Let's map explicit taxes.
+                'Valor Total Produtos/Serviços': doc.valores.valor_servicos if doc.valores else None,
+                'Valor Frete': None,  # Not currently extracted
                 'Valor Desconto': doc.valores.desconto if doc.valores else None,
                 
-                # Impostos
+                # Impostos (NF-e: ICMS, IPI, PIS, COFINS)
                 'ICMS': doc.valores.icms if doc.valores else None,
                 'IPI': doc.valores.ipi if doc.valores else None,
                 'PIS': doc.valores.pis if doc.valores else None,
                 'COFINS': doc.valores.cofins if doc.valores else None,
-                'ISS': doc.valores.iss if doc.valores else None, 
                 
-                # Retenções
+                # ISS (Devido para NFS-e)
+                'ISS': doc.valores.iss if doc.valores else None,
+                
+                # Retenções (NFS-e: valores retidos na fonte)
                 'IRRF Retido': doc.valores.ir if doc.valores else None,
                 'INSS Retido': doc.valores.inss if doc.valores else None,
-                'PIS Retido': doc.valores.pis if doc.valores else None, # Common practice: if PIS is present in retention field. My extractor logic puts it in 'pis'. Need to clarify if 'pis' is retention or tax. Usually NFS-e has only Retained taxes. 
-                'COFINS Retido': doc.valores.cofins if doc.valores else None,
-                'CSLL Retida': doc.valores.csll if doc.valores else None,
-                'ISS Retido (Serviço)': doc.valores.iss if doc.valores else None,
+                'PIS Retido': doc.valores.pis_retido if doc.valores else None,
+                'COFINS Retido': doc.valores.cofins_retido if doc.valores else None,
+                'CSLL Retida': doc.valores.csll_retida if doc.valores else None,
+                'ISS Retido (Serviço)': doc.valores.iss_retido if doc.valores else None,
                 
                 'Chave Acesso NF-e': doc.chave_acesso,
                 'Observações Extração': doc.error_message if doc.error_message else ("Documento Escaneado" if doc.is_scanned else None),

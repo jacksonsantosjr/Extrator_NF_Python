@@ -71,6 +71,17 @@ class TextExtractor:
                 doc.valores = self._extract_valores(full_text, pdf)
                 doc.itens = self._extract_items(pdf)
                 
+                # POST-EXTRACTION RULES:
+                # Rule 1: IPI only exists in NF-e, never in NFS-e
+                if doc.document_type == DocumentType.NFSE and doc.valores:
+                    doc.valores.ipi = None
+                
+                # Rule 2: ISS only exists in NFS-e, never in NF-e
+                # ISS is a service tax, NF-e is for merchandise operations
+                if doc.document_type == DocumentType.NFE and doc.valores:
+                    doc.valores.iss = None
+                    doc.valores.iss_retido = None
+                
                 doc.is_scanned = False
                 
         except Exception as e:
@@ -1044,29 +1055,326 @@ class TextExtractor:
         
         return best_match
     def _extract_valores(self, text: str, pdf: pdfplumber.PDF) -> TaxValues:
-        """Extract monetary values"""
+        """Extract monetary values using spatial extraction with regex fallback"""
         valores = TaxValues()
         
-        # 1. Spatial Extraction (Most Reliable)
+        # Expanded keywords for spatial extraction
+        VALOR_TOTAL_KEYWORDS = [
+            'Valor Total', 'Total da Nota', 'Valor a Pagar', 'VALOR NF',
+            'Total Geral', 'Valor Total Nota', 'TOTAL', 'Vl Total',
+            'Valor Líquido', 'Líquido', 'Total Líquido'
+        ]
+        VALOR_SERVICOS_KEYWORDS = [
+            'Valor dos Serviços', 'Total Serviços', 'Base de Cálculo',
+            'Valor Produtos', 'Vl Serviços', 'Base Cálculo ISS',
+            'Valor Total dos Serviços', 'VALOR DOS SERVIÇOS'
+        ]
+        ISS_KEYWORDS = [
+            'Valor do ISS', 'ISSQN Devido', 'ISS Retido', 'Valor ISS',
+            'ISSQN', 'ISS a Reter', 'ISS'
+        ]
+        DESCONTO_KEYWORDS = ['Desconto', 'Descontos', 'Desc.', 'Total Descontos']
+        PIS_KEYWORDS = ['PIS', 'PIS Retido', 'Valor PIS']
+        COFINS_KEYWORDS = ['COFINS', 'COFINS Retido', 'Valor COFINS']
+        IR_KEYWORDS = ['IR', 'IRRF', 'IR Retido', 'Imposto de Renda']
+        INSS_KEYWORDS = ['INSS', 'INSS Retido', 'Valor INSS']
+        CSLL_KEYWORDS = ['CSLL', 'CSLL Retida', 'Valor CSLL']
+        ICMS_KEYWORDS = ['ICMS', 'Valor ICMS', 'ICMS Total']
+        IPI_KEYWORDS = ['IPI', 'Valor IPI', 'IPI Total']
+        
+        # 1. Spatial Extraction (for text-based PDFs)
         if pdf:
             # Total
-            v = self._extract_value_spatial(pdf, ['Valor Total', 'Valor Líquido', 'Valor a Pagar'])
+            v = self._extract_value_spatial(pdf, VALOR_TOTAL_KEYWORDS)
             if v: valores.valor_total = v
             
             # Serviços
-            v = self._extract_value_spatial(pdf, ['Valor dos Serviços', 'Total Serviços'])
+            v = self._extract_value_spatial(pdf, VALOR_SERVICOS_KEYWORDS)
             if v: valores.valor_servicos = v
-            elif valores.valor_total: valores.valor_servicos = valores.valor_total
+            
+            # Valor Líquido (if different from total)
+            v = self._extract_value_spatial(pdf, ['Valor Líquido', 'Líquido a Receber', 'Total Líquido'])
+            if v: valores.valor_liquido = v
             
             # ISS
-            v = self._extract_value_spatial(pdf, ['Valor do ISS', 'ISSQN Devido'])
+            v = self._extract_value_spatial(pdf, ISS_KEYWORDS)
             if v: valores.iss = v
-        # 2. Section/Regex Fallback (if spatial failed)
-        if not valores.valor_total:
-             # ... regex logic ...
-             pass
+            
+            # Desconto
+            v = self._extract_value_spatial(pdf, DESCONTO_KEYWORDS)
+            if v: valores.desconto = v
+            
+            # PIS
+            v = self._extract_value_spatial(pdf, PIS_KEYWORDS)
+            if v: valores.pis = v
+            
+            # COFINS
+            v = self._extract_value_spatial(pdf, COFINS_KEYWORDS)
+            if v: valores.cofins = v
+            
+            # IR
+            v = self._extract_value_spatial(pdf, IR_KEYWORDS)
+            if v: valores.ir = v
+            
+            # INSS
+            v = self._extract_value_spatial(pdf, INSS_KEYWORDS)
+            if v: valores.inss = v
+            
+            # CSLL
+            v = self._extract_value_spatial(pdf, CSLL_KEYWORDS)
+            if v: valores.csll = v
+            # ICMS
+            v = self._extract_value_spatial(pdf, ICMS_KEYWORDS)
+            if v: valores.icms = v
+            
+            # IPI
+            v = self._extract_value_spatial(pdf, IPI_KEYWORDS)
+            if v: valores.ipi = v
+        
+        # 2. Regex Extraction (always run to fill in missing values)
+        # This covers OCR documents and fills gaps from spatial extraction
+        valores = self._extract_valores_regex(text, valores)
+        
+        # 3. FINAL FALLBACK: Ensure valor_total, valor_servicos are both populated
+        # Based on web version behavior: these columns should have values
+        if valores.valor_total and not valores.valor_servicos:
+            valores.valor_servicos = valores.valor_total
+        elif valores.valor_servicos and not valores.valor_total:
+            valores.valor_total = valores.valor_servicos
+        
+        # NOTE: valor_liquido should NOT fallback to valor_total
+        # It should be extracted from document or calculated from retentions
              
         return valores
+    
+    def _extract_valores_regex(self, text: str, valores: TaxValues) -> TaxValues:
+        """
+        Extract monetary values using regex patterns.
+        This is the primary method for OCR documents where spatial positioning is lost.
+        Patterns based on analysis of 157 real documents (766 unique labels found).
+        
+        IMPORTANT RULES:
+        1. Separate ISS DEVIDO from ISS RETIDO - they go to different columns
+        2. Patterns must be more specific to avoid false positives
+        3. Fallback: if valor_total exists but not valor_servicos, copy it (and vice-versa)
+        """
+        
+        def extract_value(patterns: List[str], text: str, min_value: float = 0.01) -> Optional[float]:
+            """Try multiple patterns and return first match with value > min_value"""
+            for pattern in patterns:
+                match = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
+                if match:
+                    value_str = match.group(1)
+                    parsed = self._parse_monetary_value(value_str)
+                    if parsed and parsed >= min_value:
+                        return parsed
+            return None
+        
+        # =======================================================================
+        # VALOR TOTAL patterns (based on real documents)
+        # Must be specific to avoid capturing partial values
+        # =======================================================================
+        total_patterns = [
+            r'VALOR\s*TOTAL\s*(?:DO\s*)?(?:SERVIÇO|NOTA|DOCUMENTO)[^\d]*R?\$?\s*([\d.,]+)',
+            r'VALOR\s*(?:DA\s*)?(?:NOTA|FATURA|DOCUMENTO)\s*R?\$?\s*([\d.,]+)',
+            r'TOTAL\s*(?:DA\s*)?NOTA[^\d]*R?\$?\s*([\d.,]+)',
+            r'VALOR\s*BRUTO(?:\s*(?:DA\s*)?NOTA)?[^\d]*R?\$?\s*([\d.,]+)',
+            r'VALOR\s*DOCUMENTO\s*R?\$?\s*([\d.,]+)',
+            r'VALOR\s*A\s*PAGAR[^\d]*R?\$?\s*([\d.,]+)',
+        ]
+        if not valores.valor_total:
+            valores.valor_total = extract_value(total_patterns, text)
+        
+        # =======================================================================
+        # VALOR SERVIÇOS patterns
+        # =======================================================================
+        servicos_patterns = [
+            r'VALOR\s*(?:TOTAL\s*)?(?:DOS?\s*)?SERVIÇOS?[^\d]*=?\s*R?\$?\s*([\d.,]+)',
+            r'SERVIÇOS?\s*\(R\$\)[^\d]*([\d.,]+)',
+            r'TOTAL\s*(?:DOS?\s*)?SERVIÇOS[^\d]*R?\$?\s*([\d.,]+)',
+        ]
+        if not valores.valor_servicos:
+            valores.valor_servicos = extract_value(servicos_patterns, text)
+        
+        # =======================================================================
+        # VALOR LÍQUIDO patterns  
+        # Specific patterns that exclude "Total" indicators
+        # =======================================================================
+        liquido_patterns = [
+            r'VALOR\s*LÍQUIDO\s*(?:DA\s*)?(?:NOTA|NFS-?E|DOCUMENTO)?[^\d]*R?\$?\s*([\d.,]+)',
+            r'LÍQUIDO\s*(?:A\s*)?(?:RECEBER|PAGAR)?[^\d]*R?\$?\s*([\d.,]+)',
+            r'VALOR\s*LIQUIDO[^\d]*R?\$?\s*([\d.,]+)',
+        ]
+        if not valores.valor_liquido:
+            valores.valor_liquido = extract_value(liquido_patterns, text)
+        
+        # =======================================================================
+        # BASE DE CÁLCULO patterns
+        # =======================================================================
+        base_patterns = [
+            r'BASE\s*(?:DE\s*)?CÁLCULO[^\d]*R?\$?\s*([\d.,]+)',
+            r'B\.\s*CÁLCULO[^\d]*R?\$?\s*([\d.,]+)',
+        ]
+        if not valores.valor_servicos:
+            base_value = extract_value(base_patterns, text)
+            if base_value:
+                valores.valor_servicos = base_value
+        
+        # =======================================================================
+        # ISS DEVIDO patterns (NOT RETIDO)
+        # CRITICAL: Must exclude patterns with "RETIDO", "RETENÇÃO", "A RETER"
+        # =======================================================================
+        iss_devido_patterns = [
+            # Patterns that specifically indicate "devido" (not retained)
+            r'VALOR\s*(?:DO\s*)?ISS(?:QN)?\s*(?:DEVIDO)?[^\d]*\(R\$\)[^\d]*([\d.,]+)',
+            r'ISS(?:QN)?\s*DEST[AE]\s*NFS-?E[^\d]*R?\$?\s*([\d.,]+)',
+            r'ISS(?:QN)?\s*DEVIDO[^\d]*R?\$?\s*([\d.,]+)',
+            r'ISS(?:QN)?\s*APURADO[^\d]*R?\$?\s*([\d.,]+)',
+            # Generic ISS but only if not followed by RETIDO
+            r'(?<!RETIDO\s)VALOR\s*(?:DO\s*)?ISS(?:QN)?(?!\s*RETID)[^\d]*R?\$?\s*([\d.,]+)',
+        ]
+        if not valores.iss:
+            valores.iss = extract_value(iss_devido_patterns, text, min_value=1.0)
+        
+        # =======================================================================
+        # DESCONTO patterns
+        # =======================================================================
+        desconto_patterns = [
+            r'(?:\(-\)\s*)?DESCONTO(?:\s*INCONDICIONADO)?[^\d]*R?\$?\s*([\d.,]+)',
+            r'DESCONTOS?\s*(?:INCONDICIONADOS)?[^\d]*R?\$?\s*([\d.,]+)',
+        ]
+        if not valores.desconto:
+            valores.desconto = extract_value(desconto_patterns, text, min_value=0.01)
+        
+        # =======================================================================
+        # PIS patterns - DISABLED
+        # NOTE: PIS extraction disabled - patterns were too loose and capturing
+        # incorrect values. For NFS-e, PIS is always RETIDO, not DEVIDO.
+        # =======================================================================
+        # PIS patterns disabled - capturing incorrect values
+        
+        # =======================================================================
+        # COFINS patterns - DISABLED
+        # NOTE: COFINS extraction disabled - patterns were too loose.
+        # For NFS-e, COFINS is always RETIDO, not DEVIDO.
+        # =======================================================================
+        # COFINS patterns disabled - NF-e uses spatial extraction, NFS-e uses COFINS RETIDO
+        
+        # =======================================================================
+        # IRRF patterns (IR Retido na Fonte)
+        # Pattern: "IRRF (1,50%)R$ 47,25" -> capture 47,25 (value after R$)
+        # OCR variations: "IRRF (1,50$)RS 47" with $ instead of % and RS instead of R$
+        # =======================================================================
+        irrf_patterns = [
+            # IRRF (X,XX% or X,XX$)R$ or RS VALUE - handles OCR variations
+            r'IRRF\s*\([^)]*[%$]?\)\s*R[S$]?\s*([0-9][0-9.,]*)',
+            r'IR\s*\([^)]*[%$]?\)\s*R[S$]?\s*([0-9][0-9.,]*)',
+            # IR RETIDO R$ VALUE
+            r'IR\s*RETIDO\s*[^\d]*R[S$]?\s*([0-9][0-9.,]*)',
+            # IRRF standalone with value
+            r'IRRF\s+R[S$]?\s*([0-9][0-9.,]*)',
+        ]
+        if not valores.ir:
+            valores.ir = extract_value(irrf_patterns, text, min_value=1.0)
+        
+        # =======================================================================
+        # INSS RETIDO patterns
+        # =======================================================================
+        inss_patterns = [
+            # INSS RETIDO VALUE
+            r'INSS\s*RETIDO\s*[^\d]*R?\$?\s*([0-9][0-9.,]*)',
+            # INSS (X%) R$ VALUE
+            r'INSS\s*\([^)]*%?\)\s*R?\$\s*([0-9][0-9.,]*)',
+            # Retenção de 11% INSS R$ VALUE
+            r'RETENÇÃO\s*(?:DE\s*)?11%?\s*INSS\s*[^\d]*R?\$?\s*([0-9][0-9.,]*)',
+        ]
+        if not valores.inss:
+            valores.inss = extract_value(inss_patterns, text, min_value=10.0)
+        
+        # =======================================================================
+        # PIS RETIDO patterns (for NFS-e)
+        # =======================================================================
+        pis_retido_patterns = [
+            r'PIS\s*RETIDO\s*[^\d]*R?\$?\s*([0-9][0-9.,]*)',
+            r'RETENÇÃO\s*(?:NA\s*FONTE\s*)?(?:DE\s*)?PIS\s*[^\d]*R?\$?\s*([0-9][0-9.,]*)',
+        ]
+        if not valores.pis_retido:
+            valores.pis_retido = extract_value(pis_retido_patterns, text, min_value=0.01)
+        
+        # =======================================================================
+        # COFINS RETIDO patterns (for NFS-e)
+        # =======================================================================
+        cofins_retido_patterns = [
+            r'COFINS\s*RETIDO[S]?\s*[^\d]*R?\$?\s*([0-9][0-9.,]*)',
+            r'RETENÇÃO\s*(?:NA\s*FONTE\s*)?(?:DE\s*)?COFINS\s*[^\d]*R?\$?\s*([0-9][0-9.,]*)',
+        ]
+        if not valores.cofins_retido:
+            valores.cofins_retido = extract_value(cofins_retido_patterns, text, min_value=0.01)
+        
+        # =======================================================================
+        # CSLL RETIDA patterns (for NFS-e)
+        # =======================================================================
+        csll_retida_patterns = [
+            r'CSLL\s*RETIDA?\s*[^\d]*R?\$?\s*([0-9][0-9.,]*)',
+            r'RETENÇÃO\s*(?:DE\s*)?CSLL\s*[^\d]*R?\$?\s*([0-9][0-9.,]*)',
+        ]
+        if not valores.csll_retida:
+            valores.csll_retida = extract_value(csll_retida_patterns, text, min_value=0.01)
+        
+        # =======================================================================
+        # ISS RETIDO / ISSQN RETIDO patterns
+        # =======================================================================
+        iss_retido_patterns = [
+            r'ISS\s*RETIDO\s*(?:NA\s*FONTE)?\s*[^\d]*R?\$?\s*([0-9][0-9.,]*)',
+            r'ISSQN\s*RETIDO\s*(?:NA\s*FONTE)?\s*[^\d]*R?\$?\s*([0-9][0-9.,]*)',
+        ]
+        if not valores.iss_retido:
+            valores.iss_retido = extract_value(iss_retido_patterns, text, min_value=1.0)
+        
+        # =======================================================================
+        # ICMS patterns (NF-e only)
+        # =======================================================================
+        icms_patterns = [
+            r'VALOR\s*(?:DO\s*)?ICMS\s*[^\d]*R?\$?\s*([0-9][0-9.,]*)',
+            r'ICMS\s*\(R\$\)\s*[^\d]*([0-9][0-9.,]*)',
+        ]
+        if not valores.icms:
+            valores.icms = extract_value(icms_patterns, text, min_value=1.0)
+        
+        # =======================================================================
+        # IPI patterns (NF-e only, cleared for NFS-e in caller)
+        # =======================================================================
+        ipi_patterns = [
+            r'VALOR\s*(?:DO\s*)?IPI\s*[^\d]*R?\$?\s*([0-9][0-9.,]*)',
+            r'IPI\s*\(R\$\)\s*[^\d]*([0-9][0-9.,]*)',
+        ]
+        if not valores.ipi:
+            valores.ipi = extract_value(ipi_patterns, text, min_value=1.0)
+        
+        # =======================================================================
+        # OUTRAS RETENÇÕES patterns
+        # =======================================================================
+        retencoes_patterns = [
+            r'(?:OUTRAS|TOTAL)\s*RETENÇÕES[^\d]*R?\$?\s*([\d.,]+)',
+        ]
+        if not valores.outras_retencoes:
+            valores.outras_retencoes = extract_value(retencoes_patterns, text, min_value=0.01)
+        
+        # NOTE: Fallback logic moved to _extract_valores() method
+        
+        # =======================================================================
+        # FALLBACK LOGIC: Ensure both valor_total and valor_servicos are populated
+        # Rule: If one exists but not the other, copy the value
+        # =======================================================================
+        if valores.valor_total and not valores.valor_servicos:
+            valores.valor_servicos = valores.valor_total
+        elif valores.valor_servicos and not valores.valor_total:
+            valores.valor_total = valores.valor_servicos
+        
+        logger.debug(f"Extracted valores via regex: total={valores.valor_total}, servicos={valores.valor_servicos}, liquido={valores.valor_liquido}, iss={valores.iss}")
+        
+        return valores
+
     def _extract_items(self, pdf: pdfplumber.PDF) -> List[ServiceItem]:
         """Extract service items (Placeholder)"""
         return []

@@ -81,21 +81,33 @@ class Entity(BaseModel):
 
 
 class TaxValues(BaseModel):
-    """Tax and financial values"""
+    """Tax and financial values
+    
+    For NF-e: pis, cofins, icms, ipi are taxes (DEVIDO)
+    For NFS-e: pis_retido, cofins_retido, csll_retida, iss_retido are retentions
+    """
+    # Main values
     valor_total: Optional[float] = Field(None, description="Total value")
     valor_servicos: Optional[float] = Field(None, description="Services value")
+    valor_liquido: Optional[float] = Field(None, description="Net value")
     base_calculo: Optional[float] = Field(None, description="Tax base")
-    iss: Optional[float] = Field(None, description="ISS value")
-    pis: Optional[float] = Field(None, description="PIS value")
-    cofins: Optional[float] = Field(None, description="COFINS value")
-    inss: Optional[float] = Field(None, description="INSS value")
-    ir: Optional[float] = Field(None, description="IR value")
-    csll: Optional[float] = Field(None, description="CSLL value")
+    desconto: Optional[float] = Field(None, description="Discount")
+    
+    # NF-e taxes (DEVIDO)
     icms: Optional[float] = Field(None, description="ICMS value")
     ipi: Optional[float] = Field(None, description="IPI value")
+    pis: Optional[float] = Field(None, description="PIS value (NF-e)")
+    cofins: Optional[float] = Field(None, description="COFINS value (NF-e)")
+    iss: Optional[float] = Field(None, description="ISS DEVIDO value")
+    
+    # Retentions (RETIDO) - primarily for NFS-e
+    ir: Optional[float] = Field(None, description="IRRF Retido value")
+    inss: Optional[float] = Field(None, description="INSS Retido value")
+    pis_retido: Optional[float] = Field(None, description="PIS Retido value")
+    cofins_retido: Optional[float] = Field(None, description="COFINS Retido value")
+    csll_retida: Optional[float] = Field(None, description="CSLL Retida value")
+    iss_retido: Optional[float] = Field(None, description="ISS Retido value")
     outras_retencoes: Optional[float] = Field(None, description="Other retentions")
-    desconto: Optional[float] = Field(None, description="Discount")
-    valor_liquido: Optional[float] = Field(None, description="Net value")
 
 
 class ServiceItem(BaseModel):
