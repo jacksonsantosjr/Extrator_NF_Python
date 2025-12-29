@@ -69,7 +69,19 @@ class TextExtractor:
                 doc.emitente = self._extract_emitente(full_text, pdf=pdf)
                 doc.destinatario = self._extract_destinatario(full_text, pdf=pdf)
                 doc.valores = self._extract_valores(full_text, pdf)
+                
+                # Extract retentions (NFS-e only)
+                if doc.document_type == DocumentType.NFSE and doc.valores:
+                    retentions = self._extract_retentions(full_text)
+                    doc.valores.pis_retido = retentions.get('pis_retido')
+                    doc.valores.cofins_retido = retentions.get('cofins_retido')
+                    doc.valores.csll_retida = retentions.get('csll_retida')
+                    doc.valores.ir = retentions.get('irrf_retido')
+                    doc.valores.inss = retentions.get('inss_retido')
+                    doc.valores.iss_retido = retentions.get('iss_retido')
+                
                 doc.itens = self._extract_items(pdf)
+
                 
                 # POST-EXTRACTION RULES:
                 # Rule 1: IPI only exists in NF-e, never in NFS-e
@@ -1120,9 +1132,7 @@ class TextExtractor:
             v = self._extract_value_spatial(pdf, INSS_KEYWORDS)
             if v: valores.inss = v
             
-            # CSLL
-            v = self._extract_value_spatial(pdf, CSLL_KEYWORDS)
-            if v: valores.csll = v
+            # CSLL (apenas retenção, não valor devido - extraído em _extract_retentions)
             # ICMS
             v = self._extract_value_spatial(pdf, ICMS_KEYWORDS)
             if v: valores.icms = v
@@ -1374,6 +1384,244 @@ class TextExtractor:
         logger.debug(f"Extracted valores via regex: total={valores.valor_total}, servicos={valores.valor_servicos}, liquido={valores.valor_liquido}, iss={valores.iss}")
         
         return valores
+
+    def _extract_retentions(self, text: str) -> Dict[str, Optional[float]]:
+        """
+        Extract tax retention values (valores retidos na fonte).
+        
+        Uses proximity-based search to handle:
+        - Labels without spaces (PIS/COFINSRetidos)
+        - Values in adjacent lines (tabular layouts)
+        - Multiple representations of same value
+        
+        Returns dict with keys: pis_retido, cofins_retido, csll_retida, irrf_retido, inss_retido, iss_retido
+        """
+        retentions = {
+            'pis_retido': None,
+            'cofins_retido': None,
+            'csll_retida': None,
+            'irrf_retido': None,
+            'inss_retido': None,
+            'iss_retido': None,
+        }
+        
+        # 1. Try to find TRIBUTAÇÃO FEDERAL section (may fail due to OCR corruption)
+        # Pattern tolerant to OCR errors: TRIBUT + any chars + FEDERAL
+        trib_section = None
+        trib_match = re.search(r'TRIBUT[^\n]{0,20}FEDERAL.*?(?=VALOR\s+TOTAL|DISCRIMINA|TOTAIS|INFORMA[ÇC]|$)', text, re.DOTALL | re.IGNORECASE)
+        if trib_match:
+            trib_section = trib_match.group(0)
+            logger.debug(f"Found TRIBUTAÇÃO FEDERAL section: {len(trib_section)} chars")
+        
+        # Use full text as fallback
+        search_text = trib_section if trib_section else text
+        
+        # 2. Try consolidated PIS/COFINS FIRST (most reliable for TOTVS layout)
+        consolidated_pis_cofins = self._extract_consolidated_pis_cofins(text)
+        if consolidated_pis_cofins:
+            # Split proportionally: PIS 0.65%, COFINS 3% (total 3.65%)
+            retentions['pis_retido'] = round(consolidated_pis_cofins * 0.178, 2)  # 0.65/3.65
+            retentions['cofins_retido'] = round(consolidated_pis_cofins * 0.822, 2)  # 3/3.65
+            logger.debug(f"Split consolidated PIS/COFINS {consolidated_pis_cofins}: PIS={retentions['pis_retido']}, COFINS={retentions['cofins_retido']}")
+        
+        # 3. Extract individual values (only if not found in consolidated)
+        if not retentions['pis_retido']:
+            retentions['pis_retido'] = self._extract_retention_value(search_text, 'PIS')
+        if not retentions['cofins_retido']:
+            retentions['cofins_retido'] = self._extract_retention_value(search_text, 'COFINS')
+        
+        retentions['csll_retida'] = self._extract_retention_value(search_text, 'CSLL')
+        retentions['irrf_retido'] = self._extract_retention_value(search_text, 'IRRF')
+        retentions['inss_retido'] = self._extract_retention_value(search_text, 'INSS')
+        retentions['iss_retido'] = self._extract_retention_value(text, 'ISS', is_iss=True)
+        
+        # 4. Handle consolidated IRRF,CP,CSLL (if CSLL not found individually)
+        if not retentions['csll_retida']:
+            consolidated_csll = self._extract_consolidated_irrf_csll(text)
+            if consolidated_csll:
+                retentions['csll_retida'] = consolidated_csll
+        
+        logger.debug(f"Extracted retentions: {retentions}")
+        return retentions
+
+    def _extract_retention_value(self, text: str, tax_name: str, is_iss: bool = False) -> Optional[float]:
+        """
+        Extract retention value for a specific tax using proximity search.
+        
+        Handles:
+        - Direct match: "PIS RETIDO 147,80"
+        - Adjacent lines: "PIS RETIDO\n147,80"
+        - Tabular: "PIS (R$)\n43,58"
+        - Colado: "PISRetido 147,80"
+        """
+        # Patterns specific to each tax
+        patterns = {
+            'PIS': [
+                rf'{tax_name}\s*(?:/PASEP)?\s+RETID[OA]\s*[:\s]*R?\$?\s*([\d\.,]+)',
+                rf'{tax_name}Retid[oa]\s*[:\s]*R?\$?\s*([\d\.,]+)',  # Colado
+                rf'RETEN[ÇC][ÃA]O\s+(?:DE\s+)?{tax_name}\s*[:\s]*R?\$?\s*([\d\.,]+)',
+            ],
+            'COFINS': [
+                rf'{tax_name}\s+RETID[OA]\s*[:\s]*R?\$?\s*([\d\.,]+)',
+                rf'{tax_name}Retid[oa]\s*[:\s]*R?\$?\s*([\d\.,]+)',  # Colado
+                rf'RETEN[ÇC][ÃA]O\s+(?:DE\s+)?{tax_name}\s*[:\s]*R?\$?\s*([\d\.,]+)',
+            ],
+            'CSLL': [
+                rf'{tax_name}\s+RETID[OA]\s*[:\s]*R?\$?\s*([\d\.,]+)',
+                rf'{tax_name}Retid[oa]\s*[:\s]*R?\$?\s*([\d\.,]+)',  # Colado
+                rf'RETEN[ÇC][ÃA]O\s+(?:DE\s+)?{tax_name}\s*[:\s]*R?\$?\s*([\d\.,]+)',
+            ],
+            'IRRF': [
+                rf'{tax_name}\s*[:\s]*R?\$?\s*([\d\.,]+)',
+                rf'IR\s+RETIDO\s*[:\s]*R?\$?\s*([\d\.,]+)',
+            ],
+            'INSS': [
+                rf'{tax_name}\s+RETIDO\s*[:\s]*R?\$?\s*([\d\.,]+)',
+                rf'{tax_name}Retido\s*[:\s]*R?\$?\s*([\d\.,]+)',  # Colado
+                rf'RETEN[ÇC][ÃA]O\s+(?:DE\s+)?{tax_name}\s*[:\s]*R?\$?\s*([\d\.,]+)',
+            ],
+            'ISS': [
+                rf'{tax_name}\s+RETIDO\s*[:\s]*R?\$?\s*([\d\.,]+)',
+                rf'{tax_name}\s+[Aa]\s+[Rr]ETER\s*[:\s]*R?\$?\s*([\d\.,]+)',
+                rf'RETEN[ÇC][ÃA]O\s+(?:DE\s+)?{tax_name}(?:QN)?\s*[:\s]*R?\$?\s*([\d\.,]+)',
+            ],
+        }
+        
+        # Try direct patterns first
+        for pattern in patterns.get(tax_name, []):
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                value_str = match.group(1)
+                value = self._parse_monetary_value(value_str)
+                if value and value > 0:
+                    logger.debug(f"Found {tax_name} retido via pattern: {value}")
+                    return value
+        
+        # Proximity search: find label, then search nearby for value
+        label_patterns = [
+            rf'{tax_name}\s*(?:/PASEP)?\s*[\(\[]?R\$[\)\]]?',  # "PIS (R$)" or "PIS [R$]"
+            rf'{tax_name}\s+RETID[OA]',
+            rf'{tax_name}Retid[oa]',  # Colado
+        ]
+        
+        for label_pattern in label_patterns:
+            label_match = re.search(label_pattern, text, re.IGNORECASE)
+            if label_match:
+                # Search in next 200 characters (2-3 lines)
+                context_start = label_match.end()
+                context_end = min(len(text), context_start + 200)
+                context = text[context_start:context_end]
+                
+                # Find first monetary value
+                value_match = re.search(r'R?\$?\s*([\d\.]+[,]\d{2})', context)
+                if value_match:
+                    value_str = value_match.group(1)
+                    value = self._parse_monetary_value(value_str)
+                    if value and value > 0:
+                        logger.debug(f"Found {tax_name} retido via proximity: {value}")
+                        return value
+        
+        return None
+
+    def _extract_consolidated_pis_cofins(self, text: str) -> Optional[float]:
+        """Extract consolidated PIS/COFINS retention value."""
+        
+        # STRATEGY: In TOTVS layout, labels and values are in separate lines
+        # Line N:   "IRRF,CP,CSLL-Retidos PIS/COFINSRetidos ValorLíquidodaNFS-e"
+        # Line N+1: "R$67,05 R$244,72 R$6.392,87"
+        # We need to find the position of "PIS/COFINSRetidos" in label line,
+        # then extract the value at the same position in the next line
+        
+        lines = text.split('\n')
+        
+        for i, line in enumerate(lines):
+            # Find line with PIS/COFINSRetidos label
+            if re.search(r'PIS/COFINS\s*Retid[OAoa]s?', line, re.IGNORECASE):
+                # Count position of this label (how many labels before it)
+                # Split by spaces and count labels before PIS/COFINS
+                label_match = re.search(r'PIS/COFINS\s*Retid[OAoa]s?', line, re.IGNORECASE)
+                if not label_match:
+                    continue
+                
+                # Get text before PIS/COFINSRetidos
+                text_before = line[:label_match.start()]
+                
+                # Count how many "Retid" labels are before (each represents a column)
+                labels_before = len(re.findall(r'Retid[OAoa]s?', text_before, re.IGNORECASE))
+                
+                # Position is labels_before (0-indexed)
+                position = labels_before
+                
+                # Get next line (values line)
+                if i + 1 < len(lines):
+                    values_line = lines[i + 1]
+                    
+                    # Extract all monetary values from values line
+                    values = re.findall(r'R?\$?\s*([\d\.]+[,]\d{2})', values_line)
+                    
+                    # Get value at the same position
+                    if position < len(values):
+                        value_str = values[position]
+                        value = self._parse_monetary_value(value_str)
+                        if value and value > 0:
+                            logger.debug(f"Found consolidated PIS/COFINS at position {position}: {value}")
+                            return value
+        
+        # FALLBACK: Try direct patterns (for other layouts)
+        patterns = [
+            r'PIS/COFINS\s*[-]?\s*RETID[OA]S?\s*[:\s]*R?\$?\s*([\d\.,]+)',
+            r'PIS/COFINSRetid[oa]s?\s*[:\s]*R?\$?\s*([\d\.,]+)',
+            r'PIS/COFINSRetid[OA]s?\s*[:\s]*R?\$?\s*([\d\.,]+)',
+            r'Reten[çc][ãa]o\s*do\s*PIS/COFINS\s*[:\s]*R?\$?\s*([\d\.,]+)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                value_str = match.group(1)
+                value = self._parse_monetary_value(value_str)
+                if value and value > 0:
+                    logger.debug(f"Found consolidated PIS/COFINS via fallback pattern: {value}")
+                    return value
+        
+        return None
+
+    def _extract_consolidated_irrf_csll(self, text: str) -> Optional[float]:
+        """Extract CSLL from consolidated IRRF,CP,CSLL retention."""
+        
+        # Same logic as PIS/COFINS - labels and values in separate lines
+        # IRRF,CP,CSLL-Retidos is FIRST label (position 0)
+        lines = text.split('\n')
+        
+        for i, line in enumerate(lines):
+            if re.search(r'IRRF\s*,\s*CP\s*,\s*CSLL\s*[-]?\s*Retid[OAoa]s?', line, re.IGNORECASE):
+                if i + 1 < len(lines):
+                    values_line = lines[i + 1]
+                    values = re.findall(r'R?\$?\s*([\d\.]+[,]\d{2})', values_line)
+                    
+                    if len(values) > 0:
+                        value_str = values[0]  # First value = CSLL
+                        value = self._parse_monetary_value(value_str)
+                        if value and value > 0:
+                            logger.debug(f"Found CSLL at position 0: {value}")
+                            return value
+        
+        # Fallback patterns
+        patterns = [
+            r'IRRF\s*,\s*CP\s*,\s*CSLL\s*[-]?\s*RETID[OA]S?\s*[:\s]*R?\$?\s*([\d\.,]+)',
+            r'IRRF,CP,CSLL[-]?Retid[oa]s?\s*[:\s]*R?\$?\s*([\d\.,]+)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                value_str = match.group(1)
+                value = self._parse_monetary_value(value_str)
+                if value and value > 0:
+                    logger.debug(f"Found CSLL via fallback: {value}")
+                    return value
+        
+        return None
 
     def _extract_items(self, pdf: pdfplumber.PDF) -> List[ServiceItem]:
         """Extract service items (Placeholder)"""
